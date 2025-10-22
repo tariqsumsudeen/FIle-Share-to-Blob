@@ -98,6 +98,11 @@
     If not specified, processes all folders. Use forward slashes for path separators.
     Example: "documents/archive" or "reports/2023"
 
+.PARAMETER BlobTier
+    Azure Blob Storage tier to use for archived files. Options: Hot, Cool, Archive, Cold.
+    Default: Hot (for frequently accessed files). Use Cool/Cold/Archive for cost optimization.
+    Example: "Cool" for infrequently accessed files, "Archive" for long-term storage
+
 .EXAMPLE
     # Basic archival of files older than 2 years
     .\FileShareToBlob.ps1 -StorageAccountName "mystorage" -ResourceGroupName "MyRG" -FileShareName "myshare" -BlobContainerName "archive"
@@ -130,6 +135,18 @@
     # Preview archival for a specific folder (WhatIf mode)
     .\FileShareToBlob.ps1 -StorageAccountName "mystorage" -ResourceGroupName "MyRG" -FileShareName "myshare" -BlobContainerName "archive" -FolderPath "reports/2023" -WhatIfOnly $true
 
+.EXAMPLE
+    # Archive files to Cool tier for cost optimization
+    .\FileShareToBlob.ps1 -StorageAccountName "mystorage" -ResourceGroupName "MyRG" -FileShareName "myshare" -BlobContainerName "archive" -BlobTier "Cool"
+
+.EXAMPLE
+    # Archive files to Archive tier for long-term storage
+    .\FileShareToBlob.ps1 -StorageAccountName "mystorage" -ResourceGroupName "MyRG" -FileShareName "myshare" -BlobContainerName "archive" -BlobTier "Archive" -ArchiveOlderThanYears 5
+
+.EXAMPLE
+    # Archive specific folder to Cold tier with deletion
+    .\FileShareToBlob.ps1 -StorageAccountName "mystorage" -ResourceGroupName "MyRG" -FileShareName "myshare" -BlobContainerName "archive" -FolderPath "old-documents" -BlobTier "Cold" -DeleteAfterVerify $true
+
 .NOTES
     - Requires Az.Storage, Az.Accounts, and Az.Resources modules
     - Designed for Azure Automation Account with Managed Identity
@@ -137,6 +154,8 @@
     - Supports both PowerShell 5.1 and 7.2 runtimes
     - Includes comprehensive error handling and logging
     - Creates stub files to track archived files and prevent re-processing
+    - Blob tier selection helps optimize storage costs (Hot/Cool/Cold/Archive)
+    - Archive tier has retrieval delays and costs - use for long-term storage only
 
 .AUTHOR
     Azure File Share Archival Script
@@ -199,7 +218,11 @@ param(
     [int]$ArchiveOlderThanYears = 2,
 
     [Parameter(Mandatory=$false)]
-    [string]$FolderPath = ""
+    [string]$FolderPath = "",
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("Hot", "Cool", "Archive", "Cold")]
+    [string]$BlobTier = "Hot"
 )
 
 Import-Module Az.Accounts -ErrorAction Stop
@@ -524,13 +547,15 @@ function Queue-BlobCopiesForOldFiles {
                 Write-Output ("[WHATIF] Would copy: share '{0}' file '{1}' -> {2}/{3}" -f $ShareName, ($relativeSegments -join '/'), $ContainerName, $destBlobName)
             } else {
                 try {
+                    # Try to set blob tier during copy if possible
                     $copyJob = Start-AzStorageBlobCopy -SrcShareName $ShareName -SrcFilePath ($relativeSegments -join '/') -DestContainer $ContainerName -DestBlob $destBlobName -Context $Context -Force
                     $jobObj = [pscustomobject]@{ 
                         Container = $ContainerName; 
                         BlobName = $destBlobName; 
                         CopyId = $copyJob.CopyId;
                         SourceShare = $ShareName;
-                        SourceRelativePath = ($relativeSegments -join '/')
+                        SourceRelativePath = ($relativeSegments -join '/');
+                        BlobTier = $BlobTier
                     }
                     $copyJobs.Add($jobObj)
                     Write-Output ("[DEBUG] Created job object: Container={0}, BlobName={1}, Properties={2}" -f $jobObj.Container, $jobObj.BlobName, ($jobObj | Get-Member -MemberType Property | Select-Object -ExpandProperty Name | Sort-Object))
@@ -645,6 +670,40 @@ function Wait-Verify-And-Delete {
                 if ($blob) {
                         $verified++
                     Write-Output ("[VERIFY] Verified copy: {0}/{1}" -f $container, $blobName)
+                    
+                    # Set blob tier if specified and different from current tier
+                    if ($job -and $job.PSObject.Properties['BlobTier'] -and $job.BlobTier) {
+                        try {
+                            $currentTier = $blob.BlobTier
+                            if ($currentTier -ne $job.BlobTier) {
+                                # Use Azure Storage SDK approach (most reliable in Automation Account)
+                                try {
+                                    # Load Azure.Storage.Blobs SDK if available
+                                    if (-not ([Type]::GetType('Azure.Storage.Blobs.BlobClient, Azure.Storage.Blobs'))) {
+                                        try { [void][System.Reflection.Assembly]::Load('Azure.Storage.Blobs') } catch { }
+                                    }
+                                    
+                                    if ([Type]::GetType('Azure.Storage.Blobs.BlobClient, Azure.Storage.Blobs')) {
+                                        # Use Azure Storage SDK with storage account key
+                                        $storageKey = $Context.StorageAccount.Credentials.ExportBase64EncodedKey()
+                                        $credential = [Azure.Storage.StorageSharedKeyCredential]::new($Context.StorageAccountName, $storageKey)
+                                        $blobUri = "https://$($Context.StorageAccountName).blob.core.windows.net/$container/$blobName"
+                                        $blobClient = [Azure.Storage.Blobs.BlobClient]::new([System.Uri]$blobUri, $credential)
+                                        $blobClient.SetAccessTier($job.BlobTier)
+                                        Write-Output ("[BLOB-TIER] Set tier for {0}/{1} to {2} using Azure Storage SDK" -f $container, $blobName, $job.BlobTier)
+                                    } else {
+                                        Write-Warning ("[BLOB-TIER] Azure Storage SDK not available, skipping tier setting for {0}/{1}" -f $container, $blobName)
+                                    }
+                                } catch {
+                                    Write-Warning ("[BLOB-TIER] Failed to set tier for {0}/{1}: {2}" -f $container, $blobName, $_.Exception.Message)
+                                }
+                            } else {
+                                Write-Output ("[BLOB-TIER] {0}/{1} already has tier {2}" -f $container, $blobName, $job.BlobTier)
+                            }
+                        } catch {
+                            Write-Warning ("[BLOB-TIER] Failed to set tier for {0}/{1}: {2}" -f $container, $blobName, $_.Exception.Message)
+                        }
+                    }
 
                         if ($DeleteAfterVerify) {
                         Write-Output ("[DELETE] DeleteAfterVerify is true; WhatIfOnly={0}" -f $WhatIfOnly)
@@ -782,7 +841,7 @@ Write-Output "Storage Account: $StorageAccountName | Resource Group: $ResourceGr
 Write-Output "File Share: $FileShareName | Destination Container: $BlobContainerName"
 Write-Output "WhatIfOnly: $WhatIfOnly | DeleteAfterVerify: $DeleteAfterVerify"
 Write-Output "Stub Files: $CreateStubFiles | Suffix: $StubFileSuffix"
-Write-Output ("Params: SingleFileTestRelativePath='{0}' | SingleFileCopyRelativePath='{1}' | DebugTargetRelativePath='{2}' | ArchiveOlderThanYears={3} | FolderPath='{4}'" -f $SingleFileTestRelativePath, $SingleFileCopyRelativePath, $DebugTargetRelativePath, $ArchiveOlderThanYears, $FolderPath)
+Write-Output ("Params: SingleFileTestRelativePath='{0}' | SingleFileCopyRelativePath='{1}' | DebugTargetRelativePath='{2}' | ArchiveOlderThanYears={3} | FolderPath='{4}' | BlobTier='{5}'" -f $SingleFileTestRelativePath, $SingleFileCopyRelativePath, $DebugTargetRelativePath, $ArchiveOlderThanYears, $FolderPath, $BlobTier)
 
 $ctxInfo = Get-StorageContexts
 $ctx = $ctxInfo.Context
@@ -822,6 +881,7 @@ if ($SingleFileCopyRelativePath) {
             CopyId = $copyJob.CopyId
             SourceShare = $FileShareName
             SourceRelativePath = $normalized
+            BlobTier = $BlobTier
         }
         
         # Wait for copy to complete and then verify/delete
@@ -842,6 +902,40 @@ if ($SingleFileCopyRelativePath) {
                     Write-Output ("[VERIFY] Checking blob existence for {0}/{1}" -f $BlobContainerName, $normalized)
                     if ($blob) {
                         Write-Output ("[VERIFY] Verified copy: {0}/{1}" -f $BlobContainerName, $normalized)
+                        
+                        # Set blob tier if specified
+                        if ($BlobTier -and $BlobTier -ne "Hot") {
+                            try {
+                                $currentTier = $blob.BlobTier
+                                if ($currentTier -ne $BlobTier) {
+                                    # Use Azure Storage SDK approach (most reliable in Automation Account)
+                                    try {
+                                        # Load Azure.Storage.Blobs SDK if available
+                                        if (-not ([Type]::GetType('Azure.Storage.Blobs.BlobClient, Azure.Storage.Blobs'))) {
+                                            try { [void][System.Reflection.Assembly]::Load('Azure.Storage.Blobs') } catch { }
+                                        }
+                                        
+                                        if ([Type]::GetType('Azure.Storage.Blobs.BlobClient, Azure.Storage.Blobs')) {
+                                            # Use Azure Storage SDK with storage account key
+                                            $storageKey = $ctx.StorageAccount.Credentials.ExportBase64EncodedKey()
+                                            $credential = [Azure.Storage.StorageSharedKeyCredential]::new($ctx.StorageAccountName, $storageKey)
+                                            $blobUri = "https://$($ctx.StorageAccountName).blob.core.windows.net/$BlobContainerName/$normalized"
+                                            $blobClient = [Azure.Storage.Blobs.BlobClient]::new([System.Uri]$blobUri, $credential)
+                                            $blobClient.SetAccessTier($BlobTier)
+                                            Write-Output ("[BLOB-TIER] Set tier for {0}/{1} to {2} using Azure Storage SDK" -f $BlobContainerName, $normalized, $BlobTier)
+                                        } else {
+                                            Write-Warning ("[BLOB-TIER] Azure Storage SDK not available, skipping tier setting for {0}/{1}" -f $BlobContainerName, $normalized)
+                                        }
+                                    } catch {
+                                        Write-Warning ("[BLOB-TIER] Failed to set tier for {0}/{1}: {2}" -f $BlobContainerName, $normalized, $_.Exception.Message)
+                                    }
+                                } else {
+                                    Write-Output ("[BLOB-TIER] {0}/{1} already has tier {2}" -f $BlobContainerName, $normalized, $BlobTier)
+                                }
+                            } catch {
+                                Write-Warning ("[BLOB-TIER] Failed to set tier for {0}/{1}: {2}" -f $BlobContainerName, $normalized, $_.Exception.Message)
+                            }
+                        }
                         
                         if ($DeleteAfterVerify) {
                             Write-Output ("[DELETE] DeleteAfterVerify is true; WhatIfOnly={0}" -f $WhatIfOnly)
