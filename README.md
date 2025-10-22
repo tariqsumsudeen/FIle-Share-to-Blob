@@ -10,6 +10,8 @@ A comprehensive PowerShell script for archiving files from Azure File Share to A
 - **Stub File Creation**: Mark archived files with stub files to prevent re-processing
 - **Batch Processing**: Handle large datasets efficiently
 - **Single File Testing**: Debug and test individual files
+- **Folder Path Selection**: Target specific folders for archival operations
+- **Blob Tier Optimization**: Choose storage tiers (Hot/Cool/Cold/Archive) for cost optimization
 - **Azure Automation Ready**: Optimized for Azure Automation Account
 - **Dual Runtime Support**: Works with both PowerShell 5.1 and 7.2
 
@@ -63,6 +65,8 @@ The Managed Identity needs these roles:
 | `VerifyTimeoutSec` | int | 1800 | Verification timeout in seconds |
 | `VerifyPollIntervalSec` | int | 30 | Polling interval for verification |
 | `VerifyBatchSize` | int | 50 | Files to verify per batch |
+| `FolderPath` | string | "" | Target specific folder for archival |
+| `BlobTier` | string | "Hot" | Storage tier: Hot/Cool/Cold/Archive |
 
 ## 🔍 Testing & Debugging
 
@@ -169,6 +173,42 @@ New-AzAutomationModule -ResourceGroupName "YourResourceGroup" -AutomationAccount
   -DeleteAfterVerify $true
 ```
 
+### Example 4: Archive Specific Folder to Cool Tier
+```powershell
+.\FileShareToBlob.ps1 `
+  -StorageAccountName "your-storage-account" `
+  -ResourceGroupName "YourResourceGroup" `
+  -FileShareName "your-fileshare" `
+  -BlobContainerName "your-container" `
+  -FolderPath "documents/archive" `
+  -BlobTier "Cool" `
+  -DeleteAfterVerify $true
+```
+
+### Example 5: Long-Term Archive to Archive Tier
+```powershell
+.\FileShareToBlob.ps1 `
+  -StorageAccountName "your-storage-account" `
+  -ResourceGroupName "YourResourceGroup" `
+  -FileShareName "your-fileshare" `
+  -BlobContainerName "your-container" `
+  -ArchiveOlderThanYears 5 `
+  -BlobTier "Archive" `
+  -DeleteAfterVerify $true
+```
+
+### Example 6: Preview Folder-Specific Archive
+```powershell
+.\FileShareToBlob.ps1 `
+  -StorageAccountName "your-storage-account" `
+  -ResourceGroupName "YourResourceGroup" `
+  -FileShareName "your-fileshare" `
+  -BlobContainerName "your-container" `
+  -FolderPath "reports/2023" `
+  -BlobTier "Cold" `
+  -WhatIfOnly $true
+```
+
 ## 🔍 How It Works
 
 1. **Authentication**: Uses Managed Identity to authenticate with Azure
@@ -177,6 +217,59 @@ New-AzAutomationModule -ResourceGroupName "YourResourceGroup" -AutomationAccount
 4. **Server-Side Copy**: Copies files from File Share to Blob Storage
 5. **Verification**: Confirms successful blob creation
 6. **Cleanup**: Optionally deletes source files and creates stub files
+
+## 💰 Blob Tier Cost Optimization
+
+The script supports different Azure Blob Storage tiers for cost optimization:
+
+| Tier | Use Case | Cost | Access Time | Minimum Retention |
+|------|----------|------|-------------|-------------------|
+| **Hot** | Frequently accessed files | Highest | Immediate | None |
+| **Cool** | Infrequently accessed files | Lower | Immediate | 30 days |
+| **Cold** | Rarely accessed files | Lower | Immediate | 30 days |
+| **Archive** | Long-term storage | Lowest | 1-15 hours | 180 days |
+
+### Cost Optimization Examples
+
+**For Active Projects (Hot Tier)**
+```powershell
+-BlobTier "Hot"  # Default - for frequently accessed files
+```
+
+**For Completed Projects (Cool Tier)**
+```powershell
+-BlobTier "Cool"  # For infrequently accessed files
+```
+
+**For Long-Term Storage (Archive Tier)**
+```powershell
+-BlobTier "Archive"  # For rarely accessed files (5+ years old)
+```
+
+## 📁 Folder Path Selection
+
+Target specific folders for archival operations instead of processing the entire file share:
+
+### Basic Folder Targeting
+```powershell
+-FolderPath "documents/archive"  # Archive only files in documents/archive folder
+```
+
+### Nested Folder Examples
+```powershell
+-FolderPath "projects/2023"      # Archive files in projects/2023 folder
+-FolderPath "reports/old"        # Archive files in reports/old folder
+-FolderPath "temp"               # Archive files in temp folder
+```
+
+### Combined with Blob Tiers
+```powershell
+# Archive old documents to Cool tier
+-FolderPath "documents/old" -BlobTier "Cool"
+
+# Archive completed projects to Archive tier
+-FolderPath "projects/completed" -BlobTier "Archive"
+```
 
 ## 📝 Stub Files
 
