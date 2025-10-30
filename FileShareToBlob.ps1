@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Azure File Share to Blob Storage Archival Script with Verification and Stub File Creation
+    Azure File Share to Blob Storage Archival Script with Verification, Stub File Creation, and Folder Exclusions
 
 .DESCRIPTION
     This PowerShell script archives files from Azure File Share to Azure Blob Storage based on age criteria.
@@ -15,6 +15,7 @@
     - Optional stub file creation to mark archived files
     - Batch processing for large datasets
     - Single file testing and debugging capabilities
+    - Folder exclusions via `ExcludeFolders` (string/CSV or array)
     - Support for both PowerShell 5.1 and 7.2 runtimes
 
 .PARAMETER StorageAccountName
@@ -103,6 +104,11 @@
     Default: Hot (for frequently accessed files). Use Cool/Cold/Archive for cost optimization.
     Example: "Cool" for infrequently accessed files, "Archive" for long-term storage
 
+.PARAMETER ExcludeFolders
+    Array of folder names to exclude from archival. Can be root folders or subfolders.
+    Case-insensitive matching. Use forward slashes for path separators.
+    Example: @("temp", "logs", "backup/old") or "temp,logs,backup/old"
+
 .EXAMPLE
     # Basic archival of files older than 2 years
     .\FileShareToBlob.ps1 -StorageAccountName "mystorage" -ResourceGroupName "MyRG" -FileShareName "myshare" -BlobContainerName "archive"
@@ -147,6 +153,14 @@
     # Archive specific folder to Cold tier with deletion
     .\FileShareToBlob.ps1 -StorageAccountName "mystorage" -ResourceGroupName "MyRG" -FileShareName "myshare" -BlobContainerName "archive" -FolderPath "old-documents" -BlobTier "Cold" -DeleteAfterVerify $true
 
+.EXAMPLE
+    # Archive files excluding specific folders
+    .\FileShareToBlob.ps1 -StorageAccountName "mystorage" -ResourceGroupName "MyRG" -FileShareName "myshare" -BlobContainerName "archive" -ExcludeFolders @("temp", "logs", "backup/old")
+
+.EXAMPLE
+    # Preview archival excluding folders (WhatIf mode)
+    .\FileShareToBlob.ps1 -StorageAccountName "mystorage" -ResourceGroupName "MyRG" -FileShareName "myshare" -BlobContainerName "archive" -ExcludeFolders "temp,logs" -WhatIfOnly $true
+
 .NOTES
     - Requires Az.Storage, Az.Accounts, and Az.Resources modules
     - Designed for Azure Automation Account with Managed Identity
@@ -161,8 +175,24 @@
     Azure File Share Archival Script
 
 .VERSION
-    1.0
+    1.1
 #>
+
+# Script-level error trap - COMMENTED OUT (interferes with Azure Automation parameter detection)
+# trap {
+#     Write-Output "=========================================="
+#     Write-Output ("[SCRIPT-TRAP] Trap caught error: {0}" -f $_.Exception.Message)
+#     Write-Output ("[SCRIPT-TRAP] Error type: {0}" -f $_.Exception.GetType().FullName)
+#     Write-Output ("[SCRIPT-TRAP] Error category: {0}" -f $_.CategoryInfo.Category)
+#     Write-Output ("[SCRIPT-TRAP] Error location: {0}" -f $_.InvocationInfo.PositionMessage)
+#     Write-Output ("[SCRIPT-TRAP] Line: {0}, Column: {1}" -f $_.InvocationInfo.ScriptLineNumber, $_.InvocationInfo.OffsetInLine)
+#     Write-Output ("[SCRIPT-TRAP] Stack trace: {0}" -f $_.ScriptStackTrace)
+#     if ($_.Exception.InnerException) {
+#         Write-Output ("[SCRIPT-TRAP] Inner exception: {0}" -f $_.Exception.InnerException.Message)
+#     }
+#     Write-Output "=========================================="
+#     continue
+# }
 
 param(
     [Parameter(Mandatory=$false)]
@@ -204,8 +234,8 @@ param(
     [string]$SingleFileCopyRelativePath = $null,
 
     # Optional: log the first N decisions during scan (0 to disable)
-    [int]$ShowFirstNDecisions = 5
-    ,
+    [int]$ShowFirstNDecisions = 5,
+
     # Use SAS-based REST listing instead of RBAC listing (recommended in Automation)
     [bool]$UseSasListing = $true,
     
@@ -222,12 +252,269 @@ param(
 
     [Parameter(Mandatory=$false)]
     [ValidateSet("Hot", "Cool", "Archive", "Cold")]
-    [string]$BlobTier = "Hot"
+    [string]$BlobTier = "Hot",
+
+    [Parameter(Mandatory=$false)]
+    [object]$ExcludeFolders = @()
 )
 
+# CRITICAL: Wrap entire script execution in error handling
+try {
+    Write-Output "[SCRIPT-START] Script execution started"
+} catch {
+    Write-Output "[FATAL-ERROR] Failed to write initial message"
+    throw
+}
+
+try {
+    Write-Output "[SCRIPT-START] Parameters received:"
+} catch {
+    Write-Output "[FATAL-ERROR] Failed to write parameters header"
+    throw
+}
+
+# Test each variable individually
+try {
+    Write-Output "[SCRIPT-START] StorageAccountName parameter accessed"
+    $testStorage = $StorageAccountName
+    Write-Output "[SCRIPT-START] StorageAccountName='$testStorage'"
+} catch {
+    Write-Output "[FATAL-ERROR] Failed to access StorageAccountName: $($_.Exception.Message)"
+    throw
+}
+
+try {
+    Write-Output "[SCRIPT-START] ResourceGroupName parameter accessed"
+    $testRG = $ResourceGroupName
+    Write-Output "[SCRIPT-START] ResourceGroupName='$testRG'"
+} catch {
+    Write-Output "[FATAL-ERROR] Failed to access ResourceGroupName: $($_.Exception.Message)"
+    throw
+}
+
+try {
+    Write-Output "[SCRIPT-START] FileShareName parameter accessed"
+    $testShare = $FileShareName
+    Write-Output "[SCRIPT-START] FileShareName='$testShare'"
+} catch {
+    Write-Output "[FATAL-ERROR] Failed to access FileShareName: $($_.Exception.Message)"
+    throw
+}
+
+try {
+    Write-Output "[SCRIPT-START] BlobContainerName parameter accessed"
+    $testContainer = $BlobContainerName
+    Write-Output "[SCRIPT-START] BlobContainerName='$testContainer'"
+} catch {
+    Write-Output "[FATAL-ERROR] Failed to access BlobContainerName: $($_.Exception.Message)"
+    throw
+}
+
+# Safely display ExcludeFolders info
+try {
+    if ($null -eq $ExcludeFolders) {
+        Write-Output "[SCRIPT-START] ExcludeFolders='null'"
+        Write-Output "[SCRIPT-START] ExcludeFolders type: null"
+        Write-Output "[SCRIPT-START] ExcludeFolders count: 0"
+    } else {
+        try {
+            $excludeType = $ExcludeFolders.GetType().FullName
+        } catch {
+            $excludeType = "Unknown (error getting type: $($_.Exception.Message))"
+        }
+        
+        try {
+            if ($ExcludeFolders -is [array] -or $ExcludeFolders.GetType().IsArray) {
+                $excludeCount = $ExcludeFolders.Count
+            } elseif ($ExcludeFolders -is [string]) {
+                $excludeCount = 1
+            } else {
+                $excludeCount = "N/A (not array)"
+            }
+        } catch {
+            $excludeCount = "Error: $($_.Exception.Message)"
+        }
+        
+        try {
+            $excludeDisplay = if ($ExcludeFolders -is [string]) { 
+                $ExcludeFolders 
+            } elseif ($ExcludeFolders -is [array]) { 
+                ($ExcludeFolders -join ', ') 
+            } else { 
+                $ExcludeFolders.ToString() 
+            }
+        } catch {
+            $excludeDisplay = "Error displaying: $($_.Exception.Message)"
+        }
+        
+        Write-Output "[SCRIPT-START] ExcludeFolders='$excludeDisplay'"
+        Write-Output "[SCRIPT-START] ExcludeFolders type: $excludeType"
+        Write-Output "[SCRIPT-START] ExcludeFolders count: $excludeCount"
+    }
+} catch {
+    Write-Output "[SCRIPT-START] ERROR displaying ExcludeFolders info: $($_.Exception.Message)"
+}
+
+# Simple initialization - wrap in try-catch to prevent unhandled exceptions
+try {
+    Write-Output "[SCRIPT-START] Starting ExcludeFolders normalization..."
+    
+    # Safely get type info
+    $excludeTypeInfo = "Unknown"
+    $excludeIsNull = $false
+    try {
+        $excludeIsNull = ($null -eq $ExcludeFolders)
+        if (-not $excludeIsNull) {
+            $excludeTypeInfo = $ExcludeFolders.GetType().FullName
+        } else {
+            $excludeTypeInfo = "null"
+        }
+    } catch {
+        $excludeTypeInfo = "Error: $($_.Exception.Message)"
+    }
+    
+    Write-Output "[SCRIPT-START] ExcludeFolders before normalization: Value='$ExcludeFolders', Type='$excludeTypeInfo', IsNull=$excludeIsNull"
+    
+    # Normalize ExcludeFolders parameter if needed
+    if ($excludeIsNull) {
+        Write-Output "[SCRIPT-START] ExcludeFolders is null, setting to empty array"
+        $ExcludeFolders = @()
+    }
+    elseif ($ExcludeFolders -is [string]) {
+        Write-Output "[SCRIPT-START] ExcludeFolders is a string, splitting by comma..."
+        $tempFolders = $ExcludeFolders -split '\s*,\s*' | Where-Object { $_ -ne '' -and $_ -ne $null } | ForEach-Object { $_.Trim().Trim('/') } | Where-Object { $_ -ne '' }
+        $ExcludeFolders = $tempFolders
+        Write-Output "[SCRIPT-START] After string split, count: $($ExcludeFolders.Count)"
+    }
+    elseif ($ExcludeFolders -is [System.Array] -or $ExcludeFolders -is [System.Collections.ArrayList]) {
+        Write-Output "[SCRIPT-START] ExcludeFolders is an array/collection, normalizing..."
+        $normalizedList = New-Object System.Collections.ArrayList
+        foreach ($folder in $ExcludeFolders) {
+            try {
+                if ($null -ne $folder -and $folder -ne '') {
+                    $normalized = $folder.ToString().Trim().Trim('/')
+                    if ($normalized -ne '') {
+                        [void]$normalizedList.Add($normalized)
+                        Write-Output "[SCRIPT-START] Added normalized folder: '$normalized'"
+                    }
+                }
+            } catch {
+                Write-Output "[SCRIPT-START] Warning: Could not normalize folder item '$folder': $($_.Exception.Message)"
+            }
+        }
+        $ExcludeFolders = $normalizedList.ToArray()
+        Write-Output "[SCRIPT-START] After array normalization, count: $($ExcludeFolders.Count)"
+    }
+    elseif ($null -ne $ExcludeFolders) {
+        # Check if it's an array type using a safer method
+        $isArrayType = $false
+        try {
+            $type = $ExcludeFolders.GetType()
+            if ($type.IsArray) {
+                $isArrayType = $true
+            }
+        } catch {
+            $isArrayType = $false
+        }
+        
+        if ($isArrayType) {
+            Write-Output "[SCRIPT-START] ExcludeFolders is detected as array type, normalizing..."
+            $normalizedList = New-Object System.Collections.ArrayList
+            try {
+                foreach ($folder in $ExcludeFolders) {
+                    try {
+                        if ($null -ne $folder -and $folder -ne '') {
+                            $normalized = $folder.ToString().Trim().Trim('/')
+                            if ($normalized -ne '') {
+                                [void]$normalizedList.Add($normalized)
+                                Write-Output "[SCRIPT-START] Added normalized folder: '$normalized'"
+                            }
+                        }
+                    } catch {
+                        Write-Output "[SCRIPT-START] Warning: Could not normalize folder item '$folder': $($_.Exception.Message)"
+                    }
+                }
+                $ExcludeFolders = $normalizedList.ToArray()
+                Write-Output "[SCRIPT-START] After array normalization, count: $($ExcludeFolders.Count)"
+            } catch {
+                Write-Output "[SCRIPT-START] Error iterating array type: $($_.Exception.Message)"
+                Write-Output "[SCRIPT-START] Attempting string conversion..."
+                try {
+                    $stringVal = $ExcludeFolders.ToString().Trim()
+                    if ($stringVal -ne '') {
+                        $ExcludeFolders = @($stringVal)
+                    } else {
+                        $ExcludeFolders = @()
+                    }
+                } catch {
+                    Write-Output "[SCRIPT-START] Could not convert, setting to empty array"
+                    $ExcludeFolders = @()
+                }
+            }
+        }
+    }
+    else {
+        # Safely get type info for logging
+        $unexpectedType = "Unknown"
+        try {
+            $unexpectedType = $ExcludeFolders.GetType().FullName
+        } catch {
+            $unexpectedType = "Error getting type: $($_.Exception.Message)"
+        }
+        Write-Output "[SCRIPT-START] ExcludeFolders is unexpected type '$unexpectedType', attempting conversion..."
+        try {
+            $stringVal = $ExcludeFolders.ToString().Trim()
+            if ($stringVal -ne '') {
+                $ExcludeFolders = @($stringVal)
+                Write-Output "[SCRIPT-START] Converted to array with one element: '$stringVal'"
+            } else {
+                $ExcludeFolders = @()
+                Write-Output "[SCRIPT-START] Empty after ToString(), set to empty array"
+            }
+        } catch {
+            Write-Output "[SCRIPT-START] Could not convert ExcludeFolders: $($_.Exception.Message), setting to empty array"
+            $ExcludeFolders = @()
+        }
+    }
+    
+    # Safely display final normalized values
+    try {
+        $finalCount = if ($null -eq $ExcludeFolders) { 0 } elseif ($ExcludeFolders -is [array]) { $ExcludeFolders.Count } else { "N/A" }
+        $finalValues = if ($null -eq $ExcludeFolders) { "" } elseif ($ExcludeFolders -is [array] -and $ExcludeFolders.Count -gt 0) { ($ExcludeFolders -join ', ') } elseif ($ExcludeFolders -is [string]) { $ExcludeFolders } else { $ExcludeFolders.ToString() }
+        Write-Output "[SCRIPT-START] ExcludeFolders after normalization: Count=$finalCount, Values=[$finalValues]"
+    } catch {
+        Write-Output "[SCRIPT-START] ExcludeFolders after normalization: (error displaying final values: $($_.Exception.Message))"
+    }
+} catch {
+    Write-Output ("[INIT-ERROR] Failed to normalize ExcludeFolders: {0}" -f $_.Exception.Message)
+    Write-Output ("[INIT-ERROR] Error type: {0}" -f $_.Exception.GetType().FullName)
+    Write-Output ("[INIT-ERROR] Stack trace: {0}" -f $_.ScriptStackTrace)
+    Write-Output "[INIT-ERROR] Setting ExcludeFolders to empty array as fallback"
+    $ExcludeFolders = @()
+}
+
+# Import modules with error handling
+Write-Output "[SCRIPT-START] About to import modules..."
+try {
+    Write-Output "[SCRIPT-START] Importing Az.Accounts..."
 Import-Module Az.Accounts -ErrorAction Stop
-Import-Module Az.Storage  -ErrorAction Stop
+    Write-Output "[SCRIPT-START] Az.Accounts imported successfully"
+    
+    Write-Output "[SCRIPT-START] Importing Az.Storage..."
+    Import-Module Az.Storage -ErrorAction Stop
+    Write-Output "[SCRIPT-START] Az.Storage imported successfully"
+    
+    Write-Output "[SCRIPT-START] Importing Az.Resources..."
 Import-Module Az.Resources -ErrorAction Stop
+    Write-Output "[SCRIPT-START] Az.Resources imported successfully"
+    
+    Write-Output "[SCRIPT-START] All modules imported successfully"
+} catch {
+    Write-Output ("[MODULE-ERROR] Failed to import modules: {0}" -f $_.Exception.Message)
+    Write-Output ("[MODULE-ERROR] Type: {0}" -f $_.Exception.GetType().FullName)
+    Write-Output ("[MODULE-ERROR] Stack trace: {0}" -f $_.ScriptStackTrace)
+    throw
+}
 
 function Connect-Cloud {
     try {
@@ -338,6 +625,65 @@ function New-FileShareSas {
     return $sas
 }
 
+function Test-ShouldExcludeFile {
+    param(
+        [string]$RelativePath,
+        [string[]]$ExcludeFolders
+    )
+    
+    try {
+        # Return false if no exclusions specified
+        if ($null -eq $ExcludeFolders) {
+            return $false
+        }
+        
+        # Handle case where ExcludeFolders might not have a Count property
+        try {
+            $excludeCount = $ExcludeFolders.Count
+        } catch {
+            $excludeCount = 0
+        }
+        
+        if ($excludeCount -eq 0) {
+            return $false
+        }
+        
+        # Return false if path is empty
+        if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+            return $false
+        }
+        
+        # Normalize the path for comparison
+        $normalizedPath = $RelativePath.ToLowerInvariant().Trim('/')
+        
+        # Check each exclusion pattern
+        foreach ($excludeFolder in $ExcludeFolders) {
+            try {
+                if ($null -eq $excludeFolder -or [string]::IsNullOrWhiteSpace($excludeFolder)) {
+                    continue
+                }
+                
+                $normalizedExclude = $excludeFolder.ToString().ToLowerInvariant().Trim('/')
+                
+                # Check if the file path starts with the exclude folder
+                if ($normalizedPath.StartsWith($normalizedExclude)) {
+                    Write-Output ("[EXCLUDE] Excluding file: {0} (matches pattern: {1})" -f $RelativePath, $excludeFolder)
+                    return $true
+                }
+            } catch {
+                Write-Output ("[EXCLUDE-ERROR] Error checking exclude pattern '{0}': {1}" -f $excludeFolder, $_.Exception.Message)
+                continue
+            }
+        }
+        
+        return $false
+    } catch {
+        Write-Output ("[EXCLUDE-ERROR] Error in Test-ShouldExcludeFile: {0}" -f $_.Exception.Message)
+        # On error, don't exclude (safer to process the file than skip it)
+        return $false
+    }
+}
+
 function Get-AllFilesRecursive {
     param(
         [object]$Context,
@@ -345,7 +691,8 @@ function Get-AllFilesRecursive {
         [string]$ShareSas,
         [bool]$UseSasListing,
         [string]$AccountName,
-        [string]$FolderPath = ""
+        [string]$FolderPath = "",
+        [string[]]$ExcludeFolders = @()
     )
     function List-Path {
         param([string]$p)
@@ -409,6 +756,31 @@ function Get-AllFilesRecursive {
     $stack.Push($startPath)
     while ($stack.Count -gt 0) {
         $currentPath = [string]$stack.Pop()
+        
+        # Check if the current path is in the exclude list (case-insensitive)
+        $shouldExclude = $false
+        if ($null -ne $ExcludeFolders) {
+            try {
+                foreach ($excludeFolder in $ExcludeFolders) {
+                    try {
+                        if ($null -ne $excludeFolder -and $currentPath -ieq $excludeFolder) {
+                            $shouldExclude = $true
+                            break
+                        }
+                    } catch {
+                        Write-Output ("[ENUM-ERROR] Error comparing path '{0}' with exclude '{1}': {2}" -f $currentPath, $excludeFolder, $_.Exception.Message)
+                        continue
+                    }
+                }
+            } catch {
+                Write-Output ("[ENUM-ERROR] Error iterating ExcludeFolders: {0}" -f $_.Exception.Message)
+            }
+        }
+        if ($shouldExclude) {
+            Write-Output ("[ENUM] Skipping excluded folder: {0}" -f $currentPath)
+            continue
+        }
+        
             try {
                 $listing = List-Path -p $currentPath
                 if ($currentPath -eq '') {
@@ -421,6 +793,31 @@ function Get-AllFilesRecursive {
                     if ($isDir) {
                 $dirName = $item.Name
                 $next = if ([string]::IsNullOrEmpty($currentPath)) { $dirName } else { "$currentPath/$dirName" }
+                
+                # Check if the next path is in the exclude list (case-insensitive)
+                $shouldExcludeNext = $false
+                if ($null -ne $ExcludeFolders) {
+                    try {
+                        foreach ($excludeFolder in $ExcludeFolders) {
+                            try {
+                                if ($null -ne $excludeFolder -and $next -ieq $excludeFolder) {
+                                    $shouldExcludeNext = $true
+                                    break
+                                }
+                            } catch {
+                                Write-Output ("[ENUM-ERROR] Error comparing path '{0}' with exclude '{1}': {2}" -f $next, $excludeFolder, $_.Exception.Message)
+                                continue
+                            }
+                        }
+                    } catch {
+                        Write-Output ("[ENUM-ERROR] Error iterating ExcludeFolders: {0}" -f $_.Exception.Message)
+                    }
+                }
+                if ($shouldExcludeNext) {
+                    Write-Output ("[ENUM] Skipping excluded folder: {0}" -f $next)
+                    continue
+                }
+                
                 $stack.Push($next)
                     } else {
                         if ($UseSasListing) {
@@ -430,8 +827,8 @@ function Get-AllFilesRecursive {
                             $obj
                         } else {
                 $item
-                        }
-                    }
+            }
+        }
                 }
             } catch {
                 Write-Output ("[ENUM-ERROR] Path '{0}': {1}" -f $currentPath, $_.Exception.Message)
@@ -452,7 +849,8 @@ function Queue-BlobCopiesForOldFiles {
         [int]$MaxQueuePerBatch = 5000,
         [bool]$WhatIfOnly = $false,
         [bool]$UseSasListing = $true,
-        [string]$FolderPath = ""
+        [string]$FolderPath = "",
+        [string[]]$ExcludeFolders = @()
     )
     Write-Output ("[DEBUG] Queue-BlobCopiesForOldFiles called with WhatIfOnly={0}" -f $WhatIfOnly)
     $queued = 0
@@ -464,9 +862,10 @@ function Queue-BlobCopiesForOldFiles {
     $skippedNewer = 0
     $sampleLogged = 0
     $decisionLogged = 0
+    $excludedCount = 0
 
     Write-Output ("[DEBUG] Inside Queue-BlobCopiesForOldFiles, calling Get-AllFilesRecursive...")
-    try { $files = Get-AllFilesRecursive -Context $Context -ShareName $ShareName -ShareSas $ShareSas -UseSasListing:$UseSasListing -AccountName $StorageAccountName -FolderPath $FolderPath }
+    try { $files = Get-AllFilesRecursive -Context $Context -ShareName $ShareName -ShareSas $ShareSas -UseSasListing:$UseSasListing -AccountName $StorageAccountName -FolderPath $FolderPath -ExcludeFolders $ExcludeFolders }
     catch { Write-Output ("[ENUM] Listing failed: {0}" -f $_.Exception.Message); return [pscustomobject]@{ QueuedCount = 0; Jobs = @() } }
     
     # Debug first few objects to see their structure
@@ -505,6 +904,7 @@ function Queue-BlobCopiesForOldFiles {
             $relativeSegments = $segments[1..($segments.Length - 1)]
             $destBlobName = ($relativeSegments -join '/')
             $srcUrl = "$uri$ShareSas"
+            $relativePath = ($relativeSegments -join '/')
             } else {
                 Write-Output ("[SKIP] File object has no Uri property: {0}" -f $file.Name)
                 continue
@@ -524,6 +924,12 @@ function Queue-BlobCopiesForOldFiles {
             }
         }
         if (-not $lastWriteUtc) { continue }
+
+        # Check if file should be excluded
+        if (Test-ShouldExcludeFile -RelativePath $relativePath -ExcludeFolders $ExcludeFolders) {
+            $excludedCount++
+            continue
+        }
 
         # Debug for a specific relative path
         if ($DebugTargetRelativePath) {
@@ -584,7 +990,7 @@ function Queue-BlobCopiesForOldFiles {
         }
     }
 
-    Write-Output ("Scanned files: {0}; With NTFS header missing: {1}; Fallback used: {2}; Skipped newer: {3}" -f $scanned, $noHeaderCount, $fallbackUsedCount, $skippedNewer)
+    Write-Output ("Scanned files: {0}; With NTFS header missing: {1}; Fallback used: {2}; Skipped newer: {3}; Excluded: {4}" -f $scanned, $noHeaderCount, $fallbackUsedCount, $skippedNewer, $excludedCount)
 
     Write-Output ("[DEBUG] Queue-BlobCopiesForOldFiles returning: QueuedCount={0}, JobsCount={1}" -f $queued, $copyJobs.Count)
     if ($copyJobs.Count -gt 0) {
@@ -753,7 +1159,7 @@ function Wait-Verify-And-Delete {
                                 
                                 $deleted++
                             } catch {
-                                $failed++
+                        $failed++
                                 Write-Warning ("[DELETE] Failed to delete source '{0}/{1}': {2}" -f $srcShare, $srcRel, $_.Exception.Message)
                             }
                         }
@@ -791,10 +1197,14 @@ function Wait-Verify-And-Delete {
     }
 }
 
-# Test function recognition
-Write-Output ("[DEBUG] Function definition complete. Testing function recognition...")
-$testResult = Get-Command Wait-Verify-And-Delete -ErrorAction SilentlyContinue
-Write-Output ("[DEBUG] Function recognition test: {0}" -f ($testResult -ne $null))
+# Test function recognition - wrapped in try-catch to prevent failures
+try {
+    Write-Output ("[DEBUG] Function definition complete. Testing function recognition...")
+    $testResult = Get-Command Wait-Verify-And-Delete -ErrorAction SilentlyContinue
+    Write-Output ("[DEBUG] Function recognition test: {0}" -f ($testResult -ne $null))
+} catch {
+    Write-Output ("[DEBUG] Function recognition test failed (non-critical): {0}" -f $_.Exception.Message)
+}
 
 # Simple test function
 function Test-SimpleFunction {
@@ -803,26 +1213,38 @@ function Test-SimpleFunction {
     return "Success"
 }
 
-# Test the simple function
-Write-Output ("[DEBUG] Testing simple function...")
-$testResult = Test-SimpleFunction -Message "Hello World"
-Write-Output ("[DEBUG] Simple function result: {0}" -f $testResult)
+# Test the simple function - wrapped in try-catch
+try {
+    Write-Output ("[DEBUG] Testing simple function...")
+    $testResult = Test-SimpleFunction -Message "Hello World"
+    Write-Output ("[DEBUG] Simple function result: {0}" -f $testResult)
+} catch {
+    Write-Output ("[DEBUG] Simple function test failed (non-critical): {0}" -f $_.Exception.Message)
+}
 
 # Test Wait-Verify-And-Delete with empty jobs
-Write-Output ("[DEBUG] Testing Wait-Verify-And-Delete with empty jobs...")
-$emptyJobs = [System.Collections.Generic.List[object]]::new()
-$testResult = Wait-Verify-And-Delete -Context $null -Jobs $emptyJobs -TimeoutSec 10 -PollIntervalSec 1 -BatchSize 10 -DeleteAfterVerify $false -WhatIfOnly $false
-Write-Output ("[DEBUG] Wait-Verify-And-Delete test result: {0}" -f $testResult)
+try {
+    Write-Output ("[DEBUG] Testing Wait-Verify-And-Delete with empty jobs...")
+    $emptyJobs = [System.Collections.Generic.List[object]]::new()
+    $testResult = Wait-Verify-And-Delete -Context $null -Jobs $emptyJobs -TimeoutSec 10 -PollIntervalSec 1 -BatchSize 10 -DeleteAfterVerify $false -WhatIfOnly $false
+    Write-Output ("[DEBUG] Wait-Verify-And-Delete test result: {0}" -f $testResult)
+} catch {
+    Write-Output ("[DEBUG] Wait-Verify-And-Delete test failed (non-critical): {0}" -f $_.Exception.Message)
+}
 
-# Test Queue-BlobCopiesForOldFiles function recognition
-Write-Output ("[DEBUG] Testing Queue-BlobCopiesForOldFiles function recognition...")
-$testResult = Get-Command Queue-BlobCopiesForOldFiles -ErrorAction SilentlyContinue
-Write-Output ("[DEBUG] Queue-BlobCopiesForOldFiles function recognition: {0}" -f ($testResult -ne $null))
+# Test Queue-BlobCopiesForOldFiles function recognition - wrapped in try-catch
+try {
+    Write-Output ("[DEBUG] Testing Queue-BlobCopiesForOldFiles function recognition...")
+    $testResult = Get-Command Queue-BlobCopiesForOldFiles -ErrorAction SilentlyContinue
+    Write-Output ("[DEBUG] Queue-BlobCopiesForOldFiles function recognition: {0}" -f ($testResult -ne $null))
+} catch {
+    Write-Output ("[DEBUG] Queue-BlobCopiesForOldFiles recognition test failed (non-critical): {0}" -f $_.Exception.Message)
+}
 
 # Test Queue-BlobCopiesForOldFiles function call
 Write-Output ("[DEBUG] Testing Queue-BlobCopiesForOldFiles function call...")
 try {
-    $testResult = Queue-BlobCopiesForOldFiles -Context $null -ShareName "test" -ContainerName "test" -OlderThanUtc (Get-Date) -ShareSas "test" -WhatIfOnly $true
+    $testResult = Queue-BlobCopiesForOldFiles -Context $null -ShareName "test" -ContainerName "test" -OlderThanUtc (Get-Date) -ShareSas "test" -WhatIfOnly $true -ExcludeFolders @()
     Write-Output ("[DEBUG] Queue-BlobCopiesForOldFiles test call result: {0}" -f $testResult)
 } catch {
     Write-Output ("[DEBUG] Queue-BlobCopiesForOldFiles test call failed: {0}" -f $_.Exception.Message)
@@ -831,17 +1253,22 @@ try {
 # ----------------------------
 # Main
 # ----------------------------
+# Wrap entire main execution in try-catch to catch all unhandled exceptions
+try {
 $ErrorActionPreference = 'Stop'
 $start = Get-Date
 Connect-Cloud
 
 Write-Output "Starting archival copy from Azure Files to Blob..."
+    try {
 Write-Output "Subscription: $((Get-AzContext).Subscription.Id)"
+    } catch {
+        Write-Output "Subscription: (Unable to retrieve subscription ID)"
+    }
 Write-Output "Storage Account: $StorageAccountName | Resource Group: $ResourceGroupName"
 Write-Output "File Share: $FileShareName | Destination Container: $BlobContainerName"
 Write-Output "WhatIfOnly: $WhatIfOnly | DeleteAfterVerify: $DeleteAfterVerify"
-Write-Output "Stub Files: $CreateStubFiles | Suffix: $StubFileSuffix"
-Write-Output ("Params: SingleFileTestRelativePath='{0}' | SingleFileCopyRelativePath='{1}' | DebugTargetRelativePath='{2}' | ArchiveOlderThanYears={3} | FolderPath='{4}' | BlobTier='{5}'" -f $SingleFileTestRelativePath, $SingleFileCopyRelativePath, $DebugTargetRelativePath, $ArchiveOlderThanYears, $FolderPath, $BlobTier)
+    Write-Output "Stub Files: $CreateStubFiles | Suffix: $StubFileSuffix"
 
 $ctxInfo = Get-StorageContexts
 $ctx = $ctxInfo.Context
@@ -1017,12 +1444,17 @@ if (-not [string]::IsNullOrEmpty($FolderPath)) {
 } else {
     Write-Output "Processing all folders in the file share"
 }
+
+if ($ExcludeFolders) {
+    Write-Output ("Excluding folders: {0}" -f ($ExcludeFolders -join ", "))
+}
+
 Write-Output ("[DEBUG] About to call Get-AllFilesRecursive with: ShareName='{0}', UseSasListing={1}, AccountName='{2}', FolderPath='{3}'" -f $FileShareName, $UseSasListing, $StorageAccountName, $FolderPath)
 
 # Test enumeration directly first
 Write-Output "[DEBUG] Testing enumeration directly..."
 try {
-    $testFiles = Get-AllFilesRecursive -Context $ctx -ShareName $FileShareName -ShareSas $shareSas -UseSasListing:$UseSasListing -AccountName $StorageAccountName -FolderPath $FolderPath
+    $testFiles = Get-AllFilesRecursive -Context $ctx -ShareName $FileShareName -ShareSas $shareSas -UseSasListing:$UseSasListing -AccountName $StorageAccountName -FolderPath $FolderPath -ExcludeFolders $ExcludeFolders
     $testCount = 0
     foreach ($f in $testFiles) { $testCount++ }
     Write-Output ("[DEBUG] Direct enumeration returned {0} items" -f $testCount)
@@ -1035,7 +1467,7 @@ try {
 Write-Output "[DEBUG] Using Queue-BlobCopiesForOldFiles function..."
 try {
     Write-Output ("[DEBUG] Calling Queue-BlobCopiesForOldFiles with WhatIfOnly={0}" -f $WhatIfOnly)
-    $queueResult = Queue-BlobCopiesForOldFiles -Context $ctx -ShareName $FileShareName -ContainerName $BlobContainerName -OlderThanUtc $olderThanUtc -ShareSas $shareSas -MaxQueuePerBatch $MaxQueuePerBatch -WhatIfOnly $WhatIfOnly -UseSasListing $UseSasListing -FolderPath $FolderPath
+    $queueResult = Queue-BlobCopiesForOldFiles -Context $ctx -ShareName $FileShareName -ContainerName $BlobContainerName -OlderThanUtc $olderThanUtc -ShareSas $shareSas -MaxQueuePerBatch $MaxQueuePerBatch -WhatIfOnly $WhatIfOnly -UseSasListing $UseSasListing -FolderPath $FolderPath -ExcludeFolders $ExcludeFolders
     Write-Output ("[DEBUG] Queue-BlobCopiesForOldFiles returned: QueuedCount={0}, JobsCount={1}" -f $queueResult.QueuedCount, $queueResult.Jobs.Count)
 Write-Output ("Queued {0} copy operation(s)." -f $queueResult.QueuedCount)
 } catch {
@@ -1071,3 +1503,25 @@ if (-not $WhatIfOnly -and $queueResult.QueuedCount -gt 0) {
 
 $elapsed = (Get-Date) - $start
 Write-Output ("Done. Elapsed: {0}" -f $elapsed.ToString())
+
+} catch {
+    Write-Output "=========================================="
+    Write-Output "[GLOBAL-ERROR] Unhandled exception occurred!"
+    Write-Output "=========================================="
+    Write-Output ("[GLOBAL-ERROR] Message: {0}" -f $_.Exception.Message)
+    Write-Output ("[GLOBAL-ERROR] Type: {0}" -f $_.Exception.GetType().FullName)
+    Write-Output ("[GLOBAL-ERROR] Category: {0}" -f $_.CategoryInfo.Category)
+    Write-Output ("[GLOBAL-ERROR] Line: {0}, Column: {1}" -f $_.InvocationInfo.ScriptLineNumber, $_.InvocationInfo.OffsetInLine)
+    Write-Output ("[GLOBAL-ERROR] Script: {0}" -f $_.InvocationInfo.ScriptName)
+    Write-Output ("[GLOBAL-ERROR] Stack trace: {0}" -f $_.ScriptStackTrace)
+    if ($_.Exception.InnerException) {
+        Write-Output ("[GLOBAL-ERROR] Inner exception: {0}" -f $_.Exception.InnerException.Message)
+    }
+    Write-Output "=========================================="
+    
+    # Output error to error stream as well
+    Write-Error ("Fatal error: {0}" -f $_.Exception.Message) -ErrorAction Continue
+    
+    # Re-throw to ensure Azure Automation sees the error
+    throw
+}

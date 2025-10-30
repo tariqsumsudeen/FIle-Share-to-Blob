@@ -11,6 +11,7 @@ A comprehensive PowerShell script for archiving files from Azure File Share to A
 - **Batch Processing**: Handle large datasets efficiently
 - **Single File Testing**: Debug and test individual files
 - **Folder Path Selection**: Target specific folders for archival operations
+- **Folder Exclusions**: Skip root or subfolders from archival via `ExcludeFolders`
 - **Blob Tier Optimization**: Choose storage tiers (Hot/Cool/Cold/Archive) for cost optimization
 - **Azure Automation Ready**: Optimized for Azure Automation Account
 - **Dual Runtime Support**: Works with both PowerShell 5.1 and 7.2
@@ -67,6 +68,7 @@ The Managed Identity needs these roles:
 | `VerifyBatchSize` | int | 50 | Files to verify per batch |
 | `FolderPath` | string | "" | Target specific folder for archival |
 | `BlobTier` | string | "Hot" | Storage tier: Hot/Cool/Cold/Archive |
+| `ExcludeFolders` | string or string[] | (empty) | Folders to exclude. Accepts a comma-separated string (e.g., `"temp,logs"`) or an array (e.g., `@("temp","logs","backup/old")`). Case-insensitive. Use forward slashes. |
 
 ## 🔍 Testing & Debugging
 
@@ -183,6 +185,28 @@ New-AzAutomationModule -ResourceGroupName "YourResourceGroup" -AutomationAccount
   -FolderPath "documents/archive" `
   -BlobTier "Cool" `
   -DeleteAfterVerify $true
+```
+
+### Example 4b: Exclude Folders (comma-separated string)
+```powershell
+.
+\FileShareToBlob.ps1 `
+  -StorageAccountName "your-storage-account" `
+  -ResourceGroupName "YourResourceGroup" `
+  -FileShareName "your-fileshare" `
+  -BlobContainerName "your-container" `
+  -ExcludeFolders "temp,logs,backup/old"
+```
+
+### Example 4c: Exclude Folders (array)
+```powershell
+.
+\FileShareToBlob.ps1 `
+  -StorageAccountName "your-storage-account" `
+  -ResourceGroupName "YourResourceGroup" `
+  -FileShareName "your-fileshare" `
+  -BlobContainerName "your-container" `
+  -ExcludeFolders @("temp","logs","backup/old")
 ```
 
 ### Example 5: Long-Term Archive to Archive Tier
@@ -335,7 +359,8 @@ For issues and questions:
 
 ## 🔄 Version History
 
+- **v1.1**: Added folder exclusion (`ExcludeFolders`) with string/CSV and array support; improved Azure Automation robustness and logging
 - **v1.0**: Initial release with full archival functionality
-- Comprehensive documentation and examples
-- Azure Automation integration
-- Stub file creation and verification
+  - Comprehensive documentation and examples
+  - Azure Automation integration
+  - Stub file creation and verification
